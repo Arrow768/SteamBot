@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Linq;
+using System.Security.AccessControl;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 using SteamKit2;
 using SteamTrade;
 using SteamTrade.TradeOffer;
@@ -16,13 +19,37 @@ namespace SteamBot
         public Bot Bot { get; private set; }
         public SteamID OtherSID { get; private set; }
 
+        private bool _lastMessageWasFromTrade;
         private Task<Inventory> otherInventoryTask;
+        private TaskCompletionSource<string> _waitingOnUserResponse;
+
+        protected SteamWeb SteamWeb
+        {
+            get
+            {
+                if(Bot == null || Bot.SteamWeb == null)
+                {
+                    throw new InvalidOperationException("You cannot use 'SteamWeb' before the Bot has been initialized!");
+                }
+                return Bot.SteamWeb;
+            }
+        }
 
         public UserHandler (Bot bot, SteamID sid)
         {
             Bot = bot;
             OtherSID = sid;
             GetOtherInventory();
+        }
+
+        private bool HandleWaitingOnUserResponse(string message)
+        {
+            if(_waitingOnUserResponse == null)
+                return false;
+
+            _waitingOnUserResponse.SetResult(message);
+            _waitingOnUserResponse = null;
+            return true;
         }
 
         /// <summary>
@@ -42,7 +69,7 @@ namespace SteamBot
         /// </example>
         public void GetOtherInventory()
         {
-            otherInventoryTask = Task.Factory.StartNew(() =>Inventory.FetchInventory(OtherSID, Bot.apiKey));
+            otherInventoryTask = Task.Factory.StartNew(() =>Inventory.FetchInventory(OtherSID, Bot.ApiKey, SteamWeb));
         }
 
         public Inventory OtherInventory
@@ -73,7 +100,7 @@ namespace SteamBot
         /// </summary>
         public Log Log
         {
-            get { return Bot.log; }
+            get { return Bot.Log; }
         }
         
         /// <summary>
@@ -84,7 +111,7 @@ namespace SteamBot
         /// </value>
         public bool IsAdmin
         {
-            get { return Bot.Admins.Contains (OtherSID); }
+            get { return Bot.Admins.Contains(OtherSID); }
         }
 
         /// <summary>
@@ -113,6 +140,15 @@ namespace SteamBot
         /// This is limited to regular and emote messages.
         /// </summary>
         public abstract void OnMessage (string message, EChatEntryType type);
+
+        public void OnMessageHandler(string message, EChatEntryType type)
+        {
+            _lastMessageWasFromTrade = false;
+            if(!HandleWaitingOnUserResponse(message))
+            {
+                OnMessage(message, type);
+            }
+        }
 
         /// <summary>
         /// Called when the bot is fully logged in.
@@ -167,6 +203,26 @@ namespace SteamBot
 
         }
 
+        /// <summary>
+        /// Waits for the user to enter something into regular or trade chat, then returns it (as the result of a task)
+        /// Usage: The following displays "How many do you want to buy" and stores the user's response:
+        /// string userResponse = await GetUserResponse("How many do you want to buy?");
+        /// 
+        /// Note: calling this method causes the next user-message to NOT call OnMessage() or OnTradeMessage()
+        /// </summary>
+        /// <param name="message">An option message to display to the user.
+        /// Sent to whichever chat (normal or trade) is currently being used.</param>
+        protected virtual Task<string> GetUserResponse(string message = null)
+        {
+            if (message != null)
+            {
+                SendReplyMessage(message);
+            }
+
+            _waitingOnUserResponse = new TaskCompletionSource<string>();
+            return _waitingOnUserResponse.Task;
+        }
+
         #region Trade events
         // see the various events in SteamTrade.Trade for descriptions of these handlers.
 
@@ -186,7 +242,6 @@ namespace SteamBot
 
         public virtual void OnTradeClose ()
         {
-            Bot.log.Warn ("[USERHANDLER] TRADE CLOSED");
             Bot.CloseTrade ();
         }
 
@@ -195,6 +250,15 @@ namespace SteamBot
         public abstract void OnTradeAddItem (Schema.Item schemaItem, Inventory.Item inventoryItem);
 
         public abstract void OnTradeRemoveItem (Schema.Item schemaItem, Inventory.Item inventoryItem);
+
+        public void OnTradeMessageHandler(string message)
+        {
+            _lastMessageWasFromTrade = true;
+            if (!HandleWaitingOnUserResponse(message))
+            {
+                OnTradeMessage(message);
+            }
+        }
 
         public abstract void OnTradeMessage (string message);
 
@@ -218,5 +282,140 @@ namespace SteamBot
         public abstract void OnTradeAccept();
 
         #endregion Trade events
+
+        #region SendChatMessage methods
+
+        private void SendMessage(Action<string> messageFunc, string message, System.Timers.Timer timer, params object[] formatParams)
+        {
+            try
+            {
+                if(timer != null)
+                {
+                    timer.Dispose();
+                }
+
+                message = (formatParams != null && formatParams.Any() ? String.Format(message, formatParams) : message);
+                messageFunc(message);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(String.Format("Error occurred when sending message.  Message: \"{0}\" \nException: {1} ", message, ex.ToString()));
+            }
+        }
+
+        private void SendMessageDelayed(int delayMs, Action<string> messageFunc, string message, params object[] formatParams)
+        {
+            if (delayMs <= 0)
+            {
+                SendMessage(messageFunc, message, null, formatParams);
+                return;
+            }
+
+            System.Timers.Timer timer = new System.Timers.Timer
+            {
+                Interval = delayMs,
+                AutoReset = false
+            };
+            timer.Elapsed += (sender, args) => SendMessage(messageFunc, message, timer, formatParams);
+
+            timer.Start();
+        }
+
+        /// <summary>
+        /// A helper method for sending a chat message to the other user in the chat window (as opposed to the trade window)
+        /// </summary>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendChatMessage(string message, params object[] formatParams)
+        {
+            SendMessage(SendChatMessageImpl, message, null, formatParams);
+        }
+
+        /// <summary>
+        /// A helper method for sending a chat message to the other user in the chat window (as opposed to the trade window)
+        /// after a given delay
+        /// </summary>
+        /// <param name="delayMs">The delay, in milliseconds, to wait before sending the message</param>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendChatMessage(int delayMs, string message, params object[] formatParams)
+        {
+            SendMessageDelayed(delayMs, SendChatMessageImpl, message, formatParams);
+        }
+
+        private void SendChatMessageImpl(string message)
+        {
+            Bot.SteamFriends.SendChatMessage(OtherSID, EChatEntryType.ChatMsg, message);
+        }
+
+        /// <summary>
+        /// A helper method for sending a chat message to the other user in the trade window.
+        /// If the trade has ended, nothing this does nothing
+        /// </summary>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendTradeMessage(string message, params object[] formatParams)
+        {
+            SendMessage(SendTradeMessageImpl, message, null, formatParams);
+        }
+
+        /// <summary>
+        /// A helper method for sending a chat message to the other user in the trade window after a given delay.
+        /// If the trade has ended, nothing this does nothing
+        /// </summary>
+        /// <param name="delayMs">The delay, in milliseconds, to wait before sending the message</param>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendTradeMessage(int delayMs, string message, params object[] formatParams)
+        {
+            SendMessageDelayed(delayMs, SendTradeMessageImpl, message, formatParams);
+        }
+
+        private void SendTradeMessageImpl(string message)
+        {
+            if (Trade != null && !Trade.HasTradeCompletedOk)
+            {
+                Trade.SendMessage(message);
+            }
+        }
+
+        /// <summary>
+        /// Sends a message to the user in either the chat window or the trade window, depending on which screen
+        /// the user sent a message from last.  Useful for responding to commands.
+        /// </summary>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendReplyMessage(string message, params object[] formatParams)
+        {
+            if (_lastMessageWasFromTrade && Trade != null && !Trade.HasTradeCompletedOk)
+            {
+                SendTradeMessage(message, formatParams);
+            }
+            else
+            {
+                SendChatMessage(message, formatParams);
+            }
+        }
+
+        /// <summary>
+        /// Sends a message to the user in either the chat window or the trade window, depending on which screen
+        /// the user sent a message from last, after a gven delay.  Useful for responding to commands.
+        /// </summary>
+        /// <param name="delayMs">The delay, in milliseconds, to wait before sending the message</param>
+        /// <param name="message">The message to send to the other user</param>
+        /// <param name="formatParams">Optional.  The format parameters, using the same syntax as String.Format()</param>
+        protected virtual void SendReplyMessage(int delayMs, string message, params object[] formatParams)
+        {
+            if (_lastMessageWasFromTrade && Trade != null && !Trade.HasTradeCompletedOk)
+            {
+                SendTradeMessage(delayMs, message, formatParams);
+            }
+            else
+            {
+                SendChatMessage(delayMs, message, formatParams);
+            }
+        }
+        #endregion
     }
 }
+
